@@ -486,7 +486,15 @@ class RequestDirector:
                 parts.append(f"{ek}={ev}" if explode else f"{ek},{ev}")
             return ",".join(parts)
         if isinstance(value, list | tuple):
-            return ",".join(self._encode_path_scalar(param_name, v) for v in value)
+            # Mirror the header side: flatten a nested list one level instead
+            # of leaking its Python repr onto the wire.
+            parts = []
+            for v in value:
+                if isinstance(v, list | tuple):
+                    parts.extend(self._encode_path_scalar(param_name, i) for i in v)
+                else:
+                    parts.append(self._encode_path_scalar(param_name, v))
+            return ",".join(parts)
         return self._encode_path_scalar(param_name, value)
 
     def _build_url(

@@ -242,3 +242,19 @@ def test_path_missing_parameter_raises() -> None:
         RequestDirector(SchemaPath.from_dict({}))._build_url(
             "/items/{ids}", {}, "https://api.example.com"
         )
+
+
+async def test_path_nested_array_flattens_one_level() -> None:
+    spec = make_spec(
+        [
+            {
+                "name": "ids",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "array", "items": {"type": "string"}},
+            }
+        ],
+        path="/items/{ids}",
+    )
+    requests = await call_and_capture(spec, {"ids": [["a", "b"], "c"]})
+    assert requests[0].url.raw_path == b"/items/a,b,c"
