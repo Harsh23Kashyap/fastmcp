@@ -439,8 +439,55 @@ class RequestDirector:
                     parts.append(_query_scalar_to_str(v))
             return ",".join(parts)
         if isinstance(value, list | tuple):
-            return ",".join(_query_scalar_to_str(v) for v in value)
+            # The simple style defines primitive items only; flatten a nested
+            # list one level instead of leaking its Python repr.
+            parts = []
+            for v in value:
+                if isinstance(v, list | tuple):
+                    parts.extend(_query_scalar_to_str(i) for i in v)
+                else:
+                    parts.append(_query_scalar_to_str(v))
+            return ",".join(parts)
         return _query_scalar_to_str(value)
+
+    def _encode_path_scalar(self, param_name: str, value: Any) -> str:
+        """Encode one scalar path item, rejecting dot segments at any encoding layer."""
+        serialized = _query_scalar_to_str(value)
+        decoded = serialized
+        for _ in range(_MAX_PATH_DECODINGS):
+            if any(
+                part in {".", ".."} for part in decoded.replace("\\", "/").split("/")
+            ):
+                raise ValueError(
+                    f"Path parameter '{param_name}' cannot contain dot segments"
+                )
+            expanded = unquote(decoded)
+            if expanded == decoded:
+                break
+            decoded = expanded
+        else:
+            raise ValueError(
+                f"Path parameter '{param_name}' has too many encoding layers"
+            )
+        # quote() leaves "." unencoded; replace it so a dot segment can never
+        # reconstitute after a server decodes the path.
+        return quote(serialized, safe="").replace(".", "%2E")
+
+    def _simple_param_to_path_segment(
+        self, param_name: str, value: Any, explode: bool = False
+    ) -> str:
+        """Serialize a path parameter per the OpenAPI "simple" style, encoding each
+        item separately so the style separators stay literal on the wire."""
+        if isinstance(value, dict):
+            parts = []
+            for k, v in value.items():
+                ek = self._encode_path_scalar(param_name, k)
+                ev = self._encode_path_scalar(param_name, v)
+                parts.append(f"{ek}={ev}" if explode else f"{ek},{ev}")
+            return ",".join(parts)
+        if isinstance(value, list | tuple):
+            return ",".join(self._encode_path_scalar(param_name, v) for v in value)
+        return self._encode_path_scalar(param_name, value)
 
     def _build_url(
         self,
@@ -476,33 +523,18 @@ class RequestDirector:
 
         # Path parameters default to the OpenAPI "simple" style, so values are
         # serialized before substitution (e.g. true/false for booleans, "a,b"
-        # for arrays) instead of leaking Python reprs into the URL.
+        # for arrays) instead of leaking Python reprs into the URL. Each item
+        # is encoded separately and the style separators (",", "=") stay
+        # literal, so ids=["a", "b"] and ids=["a,b"] stay distinct on the
+        # wire; dot-segment validation runs per serialized item.
         path_explode = path_explode or {}
         url_path = path_template
         for param_name, param_value in path_params.items():
             placeholder = f"{{{param_name}}}"
             if placeholder in url_path:
-                decoded = str(param_value)
-                for _ in range(_MAX_PATH_DECODINGS):
-                    if any(
-                        part in {".", ".."}
-                        for part in decoded.replace("\\", "/").split("/")
-                    ):
-                        raise ValueError(
-                            f"Path parameter '{param_name}' cannot contain dot segments"
-                        )
-                    expanded = unquote(decoded)
-                    if expanded == decoded:
-                        break
-                    decoded = expanded
-                else:
-                    raise ValueError(
-                        f"Path parameter '{param_name}' has too many encoding layers"
-                    )
-                serialized = self._simple_param_to_str(
-                    param_value, explode=path_explode.get(param_name, False)
+                safe_value = self._simple_param_to_path_segment(
+                    param_name, param_value, path_explode.get(param_name, False)
                 )
-                safe_value = quote(serialized, safe="").replace(".", "%2E")
                 url_path = url_path.replace(placeholder, safe_value)
 
         # Combine with base URL. Plain concatenation: urljoin would read a

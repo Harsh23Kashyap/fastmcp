@@ -4,8 +4,10 @@ from typing import Any
 
 import httpx2
 import pytest
+from jsonschema_path import SchemaPath
 
 from fastmcp import Client, FastMCP
+from fastmcp.utilities.openapi.director import RequestDirector
 
 
 def make_spec(parameters: list[dict[str, Any]], path: str = "/items") -> dict[str, Any]:
@@ -165,3 +167,78 @@ async def test_path_object_serialization(explode: bool | None, expected: str) ->
     spec = make_spec([parameter], path="/items/{filter}")
     requests = await call_and_capture(spec, {"filter": {"R": 100, "G": 200}})
     assert requests[0].url.path == expected
+
+
+async def test_path_array_items_encode_separately_on_the_wire() -> None:
+    """url.path decodes %2C, so the two forms only differ on the raw wire path."""
+    spec = make_spec(
+        [
+            {
+                "name": "ids",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "array", "items": {"type": "string"}},
+            }
+        ],
+        path="/items/{ids}",
+    )
+    requests = await call_and_capture(spec, {"ids": ["a", "b"]})
+    assert requests[0].url.raw_path == b"/items/a,b"
+
+    requests = await call_and_capture(spec, {"ids": ["a,b"]})
+    assert requests[0].url.raw_path == b"/items/a%2Cb"
+
+
+async def test_path_object_pairs_encode_separately_on_the_wire() -> None:
+    spec = make_spec(
+        [
+            {
+                "name": "filter",
+                "in": "path",
+                "required": True,
+                "schema": {"type": "object"},
+            }
+        ],
+        path="/items/{filter}",
+    )
+    requests = await call_and_capture(spec, {"filter": {"R": "1,0", "G": 200}})
+    assert requests[0].url.raw_path == b"/items/R,1%2C0,G,200"
+
+
+async def test_header_nested_array_flattens_one_level() -> None:
+    spec = make_spec(
+        [
+            {
+                "name": "X-Tags",
+                "in": "header",
+                "required": True,
+                "schema": {"type": "array", "items": {"type": "string"}},
+            }
+        ]
+    )
+    requests = await call_and_capture(spec, {"X-Tags": [["a", "b"], "c"]})
+    assert requests[0].headers["x-tags"] == "a,b,c"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [".."],
+        ["a", ".."],
+        ["%2e%2e"],
+        {"lat": ".."},
+        "..",
+    ],
+)
+def test_path_serialized_items_reject_dot_segments(value: Any) -> None:
+    with pytest.raises(ValueError, match="dot segments"):
+        RequestDirector(SchemaPath.from_dict({}))._build_url(
+            "/items/{ids}", {"ids": value}, "https://api.example.com"
+        )
+
+
+def test_path_missing_parameter_raises() -> None:
+    with pytest.raises(ValueError, match="Missing required path parameters"):
+        RequestDirector(SchemaPath.from_dict({}))._build_url(
+            "/items/{ids}", {}, "https://api.example.com"
+        )
